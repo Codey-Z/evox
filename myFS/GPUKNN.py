@@ -1,5 +1,6 @@
 # GPUKNN.py
 import torch
+import time
 
 class TensorKNNClassifier:
     """
@@ -49,37 +50,116 @@ class TensorKNNClassifier:
         acc = (preds == target_expand).float().mean(dim=1)
         return acc
 
-    def cross_validate(self, all_feature_subsets, y, n_splits=5):
+    def cross_validate(self, all_feature_subsets, y, n_splits=5, batch_idx=0):
         """
         对多个特征子集同时进行交叉验证。
+        
+        GPU优化:
+        1. 预分配结果tensor避免动态内存分配
+        2. 使用更高效的索引操作
+        3. 减少不必要的数据复制
+        
         输入:
           all_feature_subsets: (B, n_samples, d)
           y: (n_samples,)
+          batch_idx: 当前批次索引（用于打印）
         输出:
-          acc: (B,)
+          acc: (B,) - 每个特征子集的平均准确率
         """
+        cv_start_time = time.time()
         device = self.device
         B, n_samples, d = all_feature_subsets.shape
-        y = y.to(device)
-        all_feature_subsets = all_feature_subsets.to(device)
-
+        
+        # 确保数据在正确设备上（避免隐式传输）
+        transfer_start = time.time()
+        if y.device != device:
+            y = y.to(device, non_blocking=True)
+        if all_feature_subsets.device != device:
+            all_feature_subsets = all_feature_subsets.to(device, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        transfer_time = time.time() - transfer_start
+        
+        # 生成随机排列索引（在GPU上）
+        prep_start = time.time()
         idxs = torch.randperm(n_samples, device=device)
-        fold_sizes = [(n_samples // n_splits) + (1 if i < (n_samples % n_splits) else 0) for i in range(n_splits)]
-        folds, start = [], 0
-        for fs in fold_sizes:
-            folds.append(idxs[start:start+fs])
-            start += fs
+        
+        # 预计算fold大小
+        fold_size = n_samples // n_splits
+        remainder = n_samples % n_splits
+        
+        # 预分配准确率tensor（避免动态append）
+        accs = torch.zeros(B, n_splits, device=device, dtype=torch.float32)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        prep_time = time.time() - prep_start
 
-        accs = torch.zeros((B, n_splits), device=device)
-
+        # 对每个fold进行评估
+        fold_times = []
         for i in range(n_splits):
-            test_idx = folds[i]
-            train_idx = torch.cat([folds[j] for j in range(n_splits) if j != i])
-            train_y, test_y = y[train_idx], y[test_idx]
+            fold_start = time.time()
+            
+            # 计算当前fold的索引范围
+            idx_start = time.time()
+            start = i * fold_size + min(i, remainder)
+            if i < remainder:
+                end = start + fold_size + 1
+            else:
+                end = start + fold_size
+            
+            # 获取测试集索引
+            test_idx = idxs[start:end]
+            
+            # 获取训练集索引（GPU优化：避免列表拼接）
+            if i == 0:
+                train_idx = idxs[end:]
+            elif i == n_splits - 1:
+                train_idx = idxs[:start]
+            else:
+                train_idx = torch.cat([idxs[:start], idxs[end:]])
+            
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            idx_time = time.time() - idx_start
+            
+            # 使用高级索引分割数据（一次性完成，在GPU上）
+            split_start = time.time()
+            train_y = y[train_idx]
+            test_y = y[test_idx]
             train_X_batch = all_feature_subsets[:, train_idx, :]
             test_X_batch = all_feature_subsets[:, test_idx, :]
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            split_time = time.time() - split_start
 
+            # 预测并计算准确率（所有操作在GPU上）
+            pred_start = time.time()
             preds = self.predict_batched_subsets(train_X_batch, train_y, test_X_batch)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            pred_time = time.time() - pred_start
+            
+            acc_start = time.time()
             accs[:, i] = self.accuracy(preds, test_y)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            acc_time = time.time() - acc_start
+            
+            fold_total = time.time() - fold_start
+            fold_times.append(fold_total)
+            
+            print(f"        [CV Fold {i+1}/{n_splits}] 索引={idx_time:.3f}s, 分割={split_time:.3f}s, 预测={pred_time:.3f}s, 准确率={acc_time:.3f}s, 总计={fold_total:.3f}s")
 
-        return accs.mean(dim=1)
+        # 返回平均准确率
+        mean_start = time.time()
+        result = accs.mean(dim=1)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        mean_time = time.time() - mean_start
+        
+        total_cv_time = time.time() - cv_start_time
+        avg_fold_time = sum(fold_times) / len(fold_times) if fold_times else 0
+        
+        print(f"        [CV 总结] 传输={transfer_time:.3f}s, 准备={prep_time:.3f}s, 平均每fold={avg_fold_time:.3f}s, 求均值={mean_time:.3f}s, CV总计={total_cv_time:.3f}s")
+        
+        return result
